@@ -34,6 +34,9 @@ def main():
     sim.tof_sigma = 0
     sim.tof_budget = 0
     sim.tof_offset_mag = 0
+    if hasattr(sim, 'acc_range'):
+        sim.acc_range = np.inf
+        sim.gyro_range = np.inf
     data = sim.run()
 
     dt = data['dt']
