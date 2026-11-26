@@ -32,7 +32,7 @@
 import numpy as np
 from quad_geom import (G, G_VEC, HIP_OFFSETS, JOINT_AXES, L1, L2, D1, D2,
                        DOWN, leg_rotations,
-                       TOF_MOUNT, TOF_RAY, TOF_RANGE, TOF_MAX_TILT)
+                       TOF_MOUNTS, TOF_RAY, TOF_MAX_TILT, TOF_BUDGET)
 
 NL = 4           # 脚数
 NJ = 12          # 関節数
@@ -88,7 +88,7 @@ class MultiImuESKF3D:
                  incl_sigma=0.5, incl_dyn_weight=5.0,
                  ddot_accel_sigma=40.0,
                  bias_walk=2e-4,
-                 accel_noise=0.08, tof_sigma=0.006,
+                 accel_noise=0.08, tof_sigma=0.003,
                  acc_bias_walk=5e-4):
         self.dt = dt
         # ノミナル状態
@@ -293,12 +293,12 @@ class MultiImuESKF3D:
         qj = qm[j:j+3] + delta[j:j+3]
         _, R12, R123 = leg_rotations(qj)
         R_WS = R_WB @ R123
-        p_foot = (p + R_WB @ HIP_OFFSETS[leg]
-                  + (R_WB @ R12) @ (L1 * DOWN) + R_WS @ TOF_MOUNT)
+        p_tof = (p + R_WB @ HIP_OFFSETS[leg]
+                 + (R_WB @ R12) @ (L1 * DOWN) + R_WS @ TOF_MOUNTS[leg])
         u = R_WS @ TOF_RAY
         if u[2] > -TOF_MAX_TILT:      # 足裏が地面をほぼ向いていない
             return None
-        return -p_foot[2] / u[2]
+        return -p_tof[2] / u[2]
 
     def update_tof(self, tof, qm):
         """tof: (4,) 各足のToF測距値 [m]。NaN=無効(接地中/範囲外)。"""
@@ -331,15 +331,16 @@ class MultiImuESKF3D:
         h = np.array(rows_h)
         z = np.array(rows_z)
         H = np.array(rows_H)
-        R = np.eye(len(h)) * self.R_tof
         y = z - h
-        # 外れ値ゲート(3σ, 地面の凹凸や誤検出対策)
+        # 外れ値の扱い: 3σを超えたイノベーションは捨てずに R を膨らませて弱く使う
+        # (Huber型)。捨てるゲートだと、推定σが小さいときに遅れ由来の大きな
+        # イノベーションが続くと全て棄却され、推定がずれたまま戻れなくなる。
+        r = np.full(len(h), self.R_tof)
+        s_diag = np.einsum('ij,jk,ik->i', H, self.P, H) + r
+        nis = y ** 2 / s_diag
+        r = r * np.maximum(1.0, nis / 9.0)
+        R = np.diag(r)
         S = H @ self.P @ H.T + R
-        keep = np.abs(y) < 3.0 * np.sqrt(np.diag(S))
-        if not keep.any():
-            return
-        y, H, S = y[keep], H[keep], S[np.ix_(keep, keep)]
-        R = np.eye(keep.sum()) * self.R_tof
         K = self.P @ H.T @ np.linalg.solve(S, np.eye(len(y)))
         self._inject(K @ y)
         I_KH = np.eye(NERR) - K @ H
@@ -358,8 +359,12 @@ def smooth_zero_phase(x, dt, hz=30.0):
 
 
 def run_estimator3d(data, update_every=3, smooth_hz=30.0,
-                    use_tof=True, tof_every=10, **kw):
+                    use_tof=True, tof_every=10, tof_lag=TOF_BUDGET / 2, **kw):
+    """tof_lag: ToF測定値の代表時刻の遅れ [s]。測定値はタイミングバジェット区間の
+    平均なので、区間中央(budget/2前)の関節角で予測値を計算する
+    (速く動くのは脚なので、関節角だけ遡れば大部分の遅れが取れる)。"""
     dt = data['dt']
+    lag = int(round(tof_lag / dt))
     n = len(data['t'])
     ekf = MultiImuESKF3D(dt=dt, **kw)
 
@@ -371,7 +376,7 @@ def run_estimator3d(data, update_every=3, smooth_hz=30.0,
     if has_tof:
         # 初期高さz: 最初の有効ToFから逆算(ニュートン法3回)
         i0 = np.argmax(np.isfinite(data['tof']).any(axis=1))
-        tof0, qm0 = data['tof'][i0], data['qm'][i0]
+        tof0, qm0 = data['tof'][i0], data['qm'][max(0, i0 - lag)]
         for _ in range(3):
             state = (ekf.q, ekf.delta, ekf.ddot, ekf.bg,
                      ekf.p, ekf.v, ekf.ba)
@@ -401,7 +406,7 @@ def run_estimator3d(data, update_every=3, smooth_hz=30.0,
                        data['qm'][i], data['qm_dot'][i],
                        alpha_B[i], qm_ddot[i])
         if has_tof and i % tof_every == 0:
-            ekf.update_tof(data['tof'][i], data['qm'][i])
+            ekf.update_tof(data['tof'][i], data['qm'][max(0, i - lag)])
         quat_hist[i] = ekf.q
         delta_hist[i] = ekf.delta
         bias_hist[i] = ekf.bg

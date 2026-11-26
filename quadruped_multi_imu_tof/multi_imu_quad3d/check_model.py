@@ -22,21 +22,19 @@ def main():
     if '--pybullet' in sys.argv:
         from sim3d_pybullet import QuadSimulatorPyBullet
         sim = QuadSimulatorPyBullet(duration=3.0)
-        sim.gyro_noise = 0
-        sim.acc_noise = 0
-        sim.enc_rate_noise = 0
-        sim.enc_quant = 1e-12
-        sim.gyro_bias_true[:] = 0
-        data = sim.run()
     else:
         from sim3d_numpy import QuadSimulator3D
         sim = QuadSimulator3D(dt=0.002, duration=3.0, seed=1)
-        sim.gyro_noise = 0
-        sim.acc_noise = 0
-        sim.enc_rate_noise = 0
-        sim.enc_quant = 1e-12
-        sim.gyro_bias_true[:] = 0
-        data = sim.run()
+    # ノイズ・バイアス・ToFの平均化遅れを切り、幾何と運動学だけを比べる
+    sim.gyro_noise = 0
+    sim.acc_noise = 0
+    sim.enc_rate_noise = 0
+    sim.enc_quant = 1e-12
+    sim.gyro_bias_true[:] = 0
+    sim.tof_sigma = 0
+    sim.tof_budget = 0
+    sim.tof_offset_mag = 0
+    data = sim.run()
 
     dt = data['dt']
     ekf = MultiImuESKF3D(dt=dt)

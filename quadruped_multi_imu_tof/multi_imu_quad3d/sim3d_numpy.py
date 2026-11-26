@@ -18,8 +18,9 @@ numpy製 3D四足シミュレータ(推定器検証用・運動学ベース)
 import numpy as np
 from scipy.spatial.transform import Rotation as Rot
 from quad_geom import (G, G_VEC, HIP_OFFSETS, L1, L2, D1, D2, DOWN,
-                       leg_rotations, TOF_MOUNT, TOF_RAY, TOF_SIGMA,
-                       TOF_RANGE, TOF_MAX_TILT)
+                       leg_rotations, FOOT_R, TOF_MOUNTS, TOF_RAY,
+                       TOF_MAX_TILT, TOF_SIGMA, TOF_BUDGET, TOF_OFFSET_MAG,
+                       tof_measure)
 
 NL = 4
 NJ = 12
@@ -44,6 +45,9 @@ class QuadSimulator3D:
         self.acc_noise = 0.05
         self.enc_quant = 0.001
         self.enc_rate_noise = 0.01
+        self.tof_sigma = TOF_SIGMA
+        self.tof_budget = TOF_BUDGET
+        self.tof_offset_mag = TOF_OFFSET_MAG
         self.gyro_bias_true = self.rng.uniform(-0.03, 0.03, size=(NIMU, 3))
         self.acc_bias_true = self.rng.uniform(
             -1, 1, size=(NIMU, 3)) * self.accel_bias_mag
@@ -104,7 +108,8 @@ class QuadSimulator3D:
         # --- 順運動学: 各IMUの回転行列と位置 ---
         Rmats = np.zeros((n, NIMU, 3, 3))
         pos = np.zeros((n, NIMU, 3))
-        p_foot = np.zeros((n, NL, 3))
+        p_sole = np.zeros((n, NL, 3))   # 足先の球の最下点(下腿鉛直時)
+        p_tof = np.zeros((n, NL, 3))    # ToFセンサ位置
         RB = R_WB.as_matrix()
         Rmats[:, 0] = RB
         pos[:, 0] = p_B
@@ -120,26 +125,28 @@ class QuadSimulator3D:
                 pos[i, 1 + 2*leg] = p_hip + R_WT @ (D1 * DOWN)
                 pos[i, 2 + 2*leg] = (p_hip + R_WT @ (L1 * DOWN)
                                      + R_WS @ (D2 * DOWN))
-                p_foot[i, leg] = (p_hip + R_WT @ (L1 * DOWN)
-                                  + R_WS @ TOF_MOUNT)
+                p_sole[i, leg] = (p_hip + R_WT @ (L1 * DOWN)
+                                  + R_WS @ (L2 * DOWN)) - [0, 0, FOOT_R]
+                p_tof[i, leg] = (p_hip + R_WT @ (L1 * DOWN)
+                                 + R_WS @ TOF_MOUNTS[leg])
 
-        # --- 接地面(z=0)に対する高さ調整: 最下点クリアランス1cm ---
-        # (運動学シミュレータのため接触は解かず、足先が地面上を掃くよう
-        #  全体を鉛直シフトする。定数シフトなので加速度は不変)
-        shift = 0.01 - p_foot[:, :, 2].min()
+        # --- 接地面(z=0)に対する高さ調整: 足先の球の最下点が地面に触れる ---
+        # (運動学シミュレータのため接触は解かず、全体を鉛直シフトして
+        #  最も低くなった瞬間に球の底が z=0 に触れるようにする。
+        #  定数シフトなので加速度は不変)
+        shift = -p_sole[:, :, 2].min()
         p_B[:, 2] += shift
         pos[:, :, 2] += shift
-        p_foot[:, :, 2] += shift
+        p_tof[:, :, 2] += shift
 
-        # --- 足裏ToF測距(地面z=0の平面, 有効範囲・角度ゲート) ---
-        tof = np.full((n, NL), np.nan)
+        # --- 足裏ToF測距(地面z=0の平面, 角度ゲート, VL53L4CDモデル) ---
+        d_true = np.full((n, NL), np.nan)
         for leg in range(NL):
             u = np.einsum('nij,j->ni', Rmats[:, 2 + 2*leg], TOF_RAY)
             valid = u[:, 2] < -TOF_MAX_TILT
-            d = np.where(valid, -p_foot[:, leg, 2] / u[:, 2], np.nan)
-            d += TOF_SIGMA * self.rng.standard_normal(n)
-            d[(d < TOF_RANGE[0]) | (d > TOF_RANGE[1])] = np.nan
-            tof[:, leg] = d
+            d_true[:, leg] = np.where(valid, -p_tof[:, leg, 2] / u[:, 2], np.nan)
+        tof = tof_measure(d_true, dt, self.rng, sigma=self.tof_sigma,
+                          budget=self.tof_budget, offset_mag=self.tof_offset_mag)
 
         # --- 角速度真値(中央差分, 回転行列の相対回転から) ---
         omega_W = np.zeros((n, NIMU, 3))
