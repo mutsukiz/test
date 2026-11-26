@@ -71,6 +71,14 @@ def skew(v):
     return np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
 
 
+def cross(a, b):
+    """3次元外積。np.crossは1回あたりのオーバーヘッドが大きく、
+    _h_legで実行時間の約8割を占めていたため手書きにした。"""
+    return np.array([a[1] * b[2] - a[2] * b[1],
+                     a[2] * b[0] - a[0] * b[2],
+                     a[0] * b[1] - a[1] * b[0]])
+
+
 # ---------------------------------------------------------------- estimator
 class MultiImuESKF3D:
     def __init__(self, dt,
@@ -182,33 +190,34 @@ class MultiImuESKF3D:
         u2 = R_WB @ (R1 @ a2)
         wT_W = wW + qdj[0] * u1 + qdj[1] * u2
         aT_W = (aW + qddj[0] * u1 + qddj[1] * u2
-                + np.cross(wW, qdj[0] * u1)
-                + np.cross(wW + qdj[0] * u1, qdj[1] * u2))
+                + cross(wW, qdj[0] * u1)
+                + cross(wW + qdj[0] * u1, qdj[1] * u2))
         R_WT = R_WB @ R12
         u3 = R_WT @ a3
         wS_W = wT_W + qdj[2] * u3
-        aS_W = aT_W + qddj[2] * u3 + np.cross(wT_W, qdj[2] * u3)
+        aS_W = aT_W + qddj[2] * u3 + cross(wT_W, qdj[2] * u3)
         R_WS = R_WB @ R123
 
         r_hip = R_WB @ HIP_OFFSETS[leg]
-        a_hip = a_B + np.cross(aW, r_hip) + np.cross(wW, np.cross(wW, r_hip))
+        a_hip = a_B + cross(aW, r_hip) + cross(wW, cross(wW, r_hip))
         r_t = R_WT @ (D1 * DOWN)
-        a_it = a_hip + np.cross(aT_W, r_t) + np.cross(wT_W, np.cross(wT_W, r_t))
+        a_it = a_hip + cross(aT_W, r_t) + cross(wT_W, cross(wT_W, r_t))
         r_k = R_WT @ (L1 * DOWN)
-        a_kn = a_hip + np.cross(aT_W, r_k) + np.cross(wT_W, np.cross(wT_W, r_k))
+        a_kn = a_hip + cross(aT_W, r_k) + cross(wT_W, cross(wT_W, r_k))
         r_s = R_WS @ (D2 * DOWN)
-        a_is = a_kn + np.cross(aS_W, r_s) + np.cross(wS_W, np.cross(wS_W, r_s))
+        a_is = a_kn + cross(aS_W, r_s) + cross(wS_W, cross(wS_W, r_s))
 
         f_T = R_WT.T @ (a_it - G_VEC) + ba[1 + 2 * leg]
         f_S = R_WS.T @ (a_is - G_VEC) + ba[2 + 2 * leg]
         return np.concatenate([g_T, g_S, f_T, f_S])
 
     def _leg_err_idx(self, leg):
-        """脚legの観測が依存する誤差状態インデックス(18,)"""
+        """脚legの観測が依存する誤差状態インデックス(24,)。
+        胴体姿勢 dθ は含めない: _h_leg の全項は R_WB·(胴体座標の量) の形で、
+        R_WB と重力が最後の R_WTᵀ(a − g) で打ち消し合うため、∂h_leg/∂dθ ≡ 0。"""
         j = 3 * leg
         return np.array(
-            list(range(0, 3))                       # 姿勢
-            + list(range(3 + j, 3 + j + 3))         # δ
+            list(range(3 + j, 3 + j + 3))           # δ
             + list(range(15 + j, 15 + j + 3))       # δ̇
             + list(range(27, 30))                   # 胴体バイアス
             + list(range(27 + 3 * (1 + 2 * leg), 30 + 3 * (1 + 2 * leg)))
