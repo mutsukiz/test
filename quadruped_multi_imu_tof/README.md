@@ -19,4 +19,11 @@ Error-State EKFで「胴体姿勢・胴体位置・全12関節のたわみ(リ�
     cd ../multi_imu_leg
     python demo.py                         # 2D版(数十秒)
 
-PyBulletを使う場合は `--pybullet` を付ける(未検証、必ずcheck_modelから)。
+PyBulletを使う場合は `--pybullet` を付ける(必ず `check_model.py --pybullet` から)。
+PyBulletは Python 3.10〜3.12 で入れる(3.13 は配布バイナリがなくビルドが失敗する):
+
+    uv venv -p 3.10 venv310
+    uv pip install -p venv310/bin/python numpy scipy matplotlib pybullet
+    venv310/bin/python check_model.py --pybullet
+
+2026-11 の変更点と現在の結果は `multi_imu_quad3d/README.md` 冒頭を参照。

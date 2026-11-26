@@ -111,8 +111,9 @@ def main():
         ax.set_title('Body height: effect of foot ToF range sensors')
 
     fig.tight_layout()
-    fig.savefig('result3d.png', dpi=130)
-    print('saved: result3d.png')
+    out = 'result3d_pybullet.png' if '--pybullet' in sys.argv else 'result3d.png'
+    fig.savefig(out, dpi=130)
+    print('saved:', out)
 
 
 if __name__ == '__main__':
