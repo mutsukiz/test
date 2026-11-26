@@ -102,7 +102,7 @@ class TeleVuer:
             if self.webrtc:
                 fn = self.main_image_binocular_webrtc if self.binocular else self.main_image_monocular_webrtc
             elif self.zmq:
-                self.img2display_shm = shared_memory.SharedMemory(create=True, size=np.prod(self.img_shape) * np.uint8().itemsize)
+                self.img2display_shm = shared_memory.SharedMemory(create=True, size=int(np.prod(self.img_shape)) * np.dtype(np.uint8).itemsize)
                 self.img2display = np.ndarray(self.img_shape, dtype=np.uint8, buffer=self.img2display_shm.buf)
                 self.latest_frame = None
                 self.new_frame_event = threading.Event()
@@ -116,7 +116,7 @@ class TeleVuer:
             if self.webrtc:
                 fn = self.main_image_binocular_webrtc_ego if self.binocular else self.main_image_monocular_webrtc_ego
             elif self.zmq:
-                self.img2display_shm = shared_memory.SharedMemory(create=True, size=np.prod(self.img_shape) * np.uint8().itemsize)
+                self.img2display_shm = shared_memory.SharedMemory(create=True, size=int(np.prod(self.img_shape)) * np.dtype(np.uint8).itemsize)
                 self.img2display = np.ndarray(self.img_shape, dtype=np.uint8, buffer=self.img2display_shm.buf)
                 self.latest_frame = None
                 self.new_frame_event = threading.Event()

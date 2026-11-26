@@ -1,5 +1,5 @@
 diff --git a/src/televuer/televuer.py b/src/televuer/televuer.py
-index 1250131..291d0f3 100644
+index 1250131..26378f3 100644
 --- a/src/televuer/televuer.py
 +++ b/src/televuer/televuer.py
 @@ -88,12 +88,10 @@ class TeleVuer:
@@ -19,6 +19,24 @@ index 1250131..291d0f3 100644
  
          self.display_mode = display_mode
          self.zmq = zmq
+@@ -104,7 +102,7 @@ class TeleVuer:
+             if self.webrtc:
+                 fn = self.main_image_binocular_webrtc if self.binocular else self.main_image_monocular_webrtc
+             elif self.zmq:
+-                self.img2display_shm = shared_memory.SharedMemory(create=True, size=np.prod(self.img_shape) * np.uint8().itemsize)
++                self.img2display_shm = shared_memory.SharedMemory(create=True, size=int(np.prod(self.img_shape)) * np.dtype(np.uint8).itemsize)
+                 self.img2display = np.ndarray(self.img_shape, dtype=np.uint8, buffer=self.img2display_shm.buf)
+                 self.latest_frame = None
+                 self.new_frame_event = threading.Event()
+@@ -118,7 +116,7 @@ class TeleVuer:
+             if self.webrtc:
+                 fn = self.main_image_binocular_webrtc_ego if self.binocular else self.main_image_monocular_webrtc_ego
+             elif self.zmq:
+-                self.img2display_shm = shared_memory.SharedMemory(create=True, size=np.prod(self.img_shape) * np.uint8().itemsize)
++                self.img2display_shm = shared_memory.SharedMemory(create=True, size=int(np.prod(self.img_shape)) * np.dtype(np.uint8).itemsize)
+                 self.img2display = np.ndarray(self.img_shape, dtype=np.uint8, buffer=self.img2display_shm.buf)
+                 self.latest_frame = None
+                 self.new_frame_event = threading.Event()
 @@ -133,7 +131,7 @@ class TeleVuer:
          else:
              raise ValueError(f"[TeleVuer] Unknown display_mode: {self.display_mode}")
