@@ -42,6 +42,15 @@ ARM_JOINTS = [
     "right_wrist_roll_joint", "right_wrist_pitch_joint", "right_wrist_yaw_joint",
 ]  # same order as the 14-dof reduced model of G1_29_ArmIK
 
+# Dex3 joints in the order of the Dex3 API / HandRetargeting (thumb 0-2, middle 0-1, index 0-1)
+LEFT_HAND_JOINTS = ["left_hand_thumb_0_joint", "left_hand_thumb_1_joint", "left_hand_thumb_2_joint",
+                    "left_hand_middle_0_joint", "left_hand_middle_1_joint",
+                    "left_hand_index_0_joint", "left_hand_index_1_joint"]
+RIGHT_HAND_JOINTS = [n.replace("left_", "right_") for n in LEFT_HAND_JOINTS]
+# "closed" pose for the simple open/close mode (signs follow the joint ranges of the MJCF)
+LEFT_HAND_CLOSED = np.array([0.0, 0.6, 1.2, -1.3, -1.4, -1.3, -1.4])
+RIGHT_HAND_CLOSED = np.array([0.0, -0.6, -1.2, 1.3, 1.4, 1.3, 1.4])
+
 # objects placed in front of the robot (world frame, pelvis at x=y=0, z=0.793).
 # G1 is small: shoulder at z~1.085, so the table top is at z=0.78 and its near edge at x=0.20.
 SCENE_EXTRA = """
@@ -83,7 +92,9 @@ class G1FirstPersonView:
         if not high_quality:
             self.m.vis.quality.offsamples = 0
         self.d = mujoco.MjData(self.m)
-        self.qadr = [self.m.jnt_qposadr[mujoco.mj_name2id(self.m, mujoco.mjtObj.mjOBJ_JOINT, n)] for n in ARM_JOINTS]
+        adr = lambda names: [self.m.jnt_qposadr[mujoco.mj_name2id(self.m, mujoco.mjtObj.mjOBJ_JOINT, n)] for n in names]
+        self.qadr = adr(ARM_JOINTS)
+        self.lhadr, self.rhadr = adr(LEFT_HAND_JOINTS), adr(RIGHT_HAND_JOINTS)
         self.torso = mujoco.mj_name2id(self.m, mujoco.mjtObj.mjOBJ_BODY, "torso_link")
         self.renderer = mujoco.Renderer(self.m, h, w)
         self.opt = mujoco.MjvOption()
@@ -105,8 +116,12 @@ class G1FirstPersonView:
         except Exception as e:
             return f"unknown ({e})"
 
-    def set_arm_q(self, q):
+    def set_arm_q(self, q, left_hand_q=None, right_hand_q=None):
         self.d.qpos[self.qadr] = q
+        if left_hand_q is not None:
+            self.d.qpos[self.lhadr] = left_hand_q
+        if right_hand_q is not None:
+            self.d.qpos[self.rhadr] = right_hand_q
         self.mj.mj_kinematics(self.m, self.d)
 
     def render_bgr(self, eye_offset=0.0):
@@ -136,14 +151,20 @@ class FpvThread(threading.Thread):
         self.high_quality = high_quality
         self.lock = threading.Lock()
         self.q = np.zeros(14)
+        self.lh = np.zeros(7)
+        self.rh = np.zeros(7)
         self.times = []
         self.stop_event = threading.Event()
         self.ready = threading.Event()
         self.error = None
 
-    def set_arm_q(self, q):
+    def set_arm_q(self, q, left_hand_q=None, right_hand_q=None):
         with self.lock:
             self.q = np.array(q, copy=True)
+            if left_hand_q is not None:
+                self.lh = np.array(left_hand_q, copy=True)
+            if right_hand_q is not None:
+                self.rh = np.array(right_hand_q, copy=True)
 
     def pop_times(self):
         with self.lock:
@@ -162,8 +183,8 @@ class FpvThread(threading.Thread):
         while not self.stop_event.is_set():
             t0 = time.perf_counter()
             with self.lock:
-                q = self.q.copy()
-            fpv.set_arm_q(q)
+                q, lh, rh = self.q.copy(), self.lh.copy(), self.rh.copy()
+            fpv.set_arm_q(q, lh, rh)
             if self.stereo:  # side-by-side: left half = left eye (televuer binocular layout)
                 img = np.hstack([fpv.render_bgr(+self.ipd / 2), fpv.render_bgr(-self.ipd / 2)])
             else:
@@ -173,6 +194,50 @@ class FpvThread(threading.Thread):
             with self.lock:
                 self.times.append(dt * 1000)
             time.sleep(max(0.0, self.period - dt))
+
+
+class DexHand:
+    """Dex3 finger targets from the XR data.
+    - "retarget": the same dex-retargeting pipeline as robot_hand_unitree.py (hand tracking only)
+    - "simple"  : open/close by pinch (hand tracking) or trigger (controller)"""
+
+    def __init__(self, mode, use_hand_tracking):
+        self.mode = "simple"
+        self.retargeting = None
+        if mode in ("auto", "retarget") and use_hand_tracking:
+            try:
+                from teleop.robot_control.hand_retargeting import HandRetargeting, HandType
+                self.retargeting = HandRetargeting(HandType.UNITREE_DEX3)
+                self.mode = "retarget"
+            except Exception as e:
+                if mode == "retarget":
+                    raise
+                print(f"[hand] dex-retargeting not available ({type(e).__name__}: {e}) -> simple open/close")
+        print(f"[hand] mode: {self.mode}")
+        self.closure = (0.0, 0.0)
+
+    @staticmethod
+    def _closure_from_distance(v):
+        # tv_wrapper: pinch / trigger values go ~10 (open / released) -> 0 (pinched / fully pressed)
+        return float(np.clip(1.0 - v / 10.0, 0.0, 1.0))
+
+    def compute(self, tele, use_hand_tracking):
+        if self.mode == "retarget":
+            r = self.retargeting
+            lp, rp = np.asarray(tele.left_hand_pos), np.asarray(tele.right_hand_pos)
+            ref_l = lp[r.left_indices[1, :]] - lp[r.left_indices[0, :]]
+            ref_r = rp[r.right_indices[1, :]] - rp[r.right_indices[0, :]]
+            lq = r.left_retargeting.retarget(ref_l)[r.left_dex_retargeting_to_hardware]
+            rq = r.right_retargeting.retarget(ref_r)[r.right_dex_retargeting_to_hardware]
+            return lq, rq
+        if use_hand_tracking:
+            cl = max(self._closure_from_distance(tele.left_hand_pinchValue), tele.left_hand_squeezeValue)
+            cr = max(self._closure_from_distance(tele.right_hand_pinchValue), tele.right_hand_squeezeValue)
+        else:
+            cl = self._closure_from_distance(tele.left_ctrl_triggerValue)
+            cr = self._closure_from_distance(tele.right_ctrl_triggerValue)
+        self.closure = (cl, cr)
+        return LEFT_HAND_CLOSED * cl, RIGHT_HAND_CLOSED * cr
 
 
 def windows_timer(enable):
@@ -216,6 +281,8 @@ def main():
     ap.add_argument("--fpv-size", default="640x480", help="WxH of the first-person view")
     ap.add_argument("--fpv-fps", type=float, default=30.0)
     ap.add_argument("--fpv-hq", action="store_true", help="shadows / reflections / anti-aliasing on")
+    ap.add_argument("--hand", choices=["auto", "retarget", "simple", "off"], default="auto",
+                    help="Dex3 fingers: dex-retargeting (hand tracking), simple open/close, or off")
     ap.add_argument("--stereo", action="store_true", help="render left/right eye views (depth perception)")
     ap.add_argument("--ipd", type=float, default=0.064, help="eye distance for --stereo [m]")
     args = ap.parse_args()
@@ -248,13 +315,19 @@ def main():
             raise fpv.error
         print(f"[fpv] MuJoCo first-person renderer ready ({W}x{H}{' per eye, stereo' if stereo else ''}).")
 
+    use_hand_tracking = args.input == "hand"
+    print(f"[xr] input mode: {args.input}"
+          + ("  (use --input controller when holding the Quest controllers)" if use_hand_tracking else ""))
+    hand = DexHand(args.hand, use_hand_tracking) if args.hand != "off" else None
+
     print("[ik] loading G1_29 model (first time may take a while)...")
     arm_ik = G1_29_ArmIK(Visualization=args.meshcat)
     print("[ik] ready. Open the Quest page and enter VR. Ctrl+C to stop.")
 
     period = 1.0 / args.frequency
     i = 0
-    ik_t, loops, overruns = [], 0, 0
+    ik_t, hd_t, loops, overruns = [], [], 0, 0
+    no_data_since = time.perf_counter()
     t_report = time.perf_counter()
     try:
         while True:
@@ -264,8 +337,13 @@ def main():
                 t1 = time.perf_counter()
                 sol_q, _ = arm_ik.solve_ik(tele.left_wrist_pose, tele.right_wrist_pose)
                 ik_t.append((time.perf_counter() - t1) * 1000)
+                lh = rh = None
+                if hand is not None:
+                    t1 = time.perf_counter()
+                    lh, rh = hand.compute(tele, use_hand_tracking)
+                    hd_t.append((time.perf_counter() - t1) * 1000)
                 if fpv is not None:
-                    fpv.set_arm_q(sol_q)
+                    fpv.set_arm_q(sol_q, lh, rh)
 
             if fpv is None and args.display != "pass-through":
                 tv.render_to_xr(make_pattern(H, W, i))
@@ -281,8 +359,19 @@ def main():
                     rd = (f" | fpv {len(rt) / el:4.1f} fps, render {np.mean(rt):5.1f} ms" if rt else " | fpv -")
                 ik = (f"IK mean {np.mean(ik_t):6.2f} ms  max {np.max(ik_t):6.2f} ms" if ik_t
                       else "waiting for XR motion data...")
-                print(f"loop {loops / el:5.1f} Hz | {ik} | overruns {overruns}{rd}")
-                ik_t, loops, overruns = [], 0, 0
+                hd = ""
+                if hd_t:
+                    hd = f" | hand {np.mean(hd_t):5.2f} ms"
+                    if hand.mode == "simple":
+                        hd += f" close L/R {hand.closure[0]:.2f}/{hand.closure[1]:.2f}"
+                print(f"loop {loops / el:5.1f} Hz | {ik}{hd} | overruns {overruns}{rd}")
+                if ik_t:
+                    no_data_since = now
+                elif now - no_data_since > 10:
+                    print(f"[xr] no {'hand' if use_hand_tracking else 'controller'} data for 10 s. "
+                          f"Holding controllers? -> --input controller. Using bare hands? -> --input hand")
+                    no_data_since = now
+                ik_t, hd_t, loops, overruns = [], [], 0, 0
                 t_report = now
 
             dt = time.perf_counter() - t0
