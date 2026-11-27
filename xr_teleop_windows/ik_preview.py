@@ -18,6 +18,7 @@ Options:
     --fpv-size 320x240   render the first-person view at a lower resolution
     --fpv-fps 30         target frame rate of the first-person view (rendered in its own thread)
     --fpv-hq             shadows / reflections / anti-aliasing on (slower)
+    --stereo             render a left and a right eye view (depth perception in the headset; 2x render cost)
 
 Reported every second: IK loop rate, IK time (mean / max), loop overruns, first-person render time / fps.
 At startup: accuracy of time.sleep(4 ms) (robot_arm.py runs a ~250 Hz sleep loop) and the OpenGL renderer.
@@ -41,18 +42,19 @@ ARM_JOINTS = [
     "right_wrist_roll_joint", "right_wrist_pitch_joint", "right_wrist_yaw_joint",
 ]  # same order as the 14-dof reduced model of G1_29_ArmIK
 
-# objects placed in front of the robot (world frame, pelvis at x=y=0, z=0.793)
+# objects placed in front of the robot (world frame, pelvis at x=y=0, z=0.793).
+# G1 is small: shoulder at z~1.085, so the table top is at z=0.78 and its near edge at x=0.20.
 SCENE_EXTRA = """
-    <body name="table" pos="0.55 0 0.70">
-      <geom type="box" size="0.25 0.45 0.02" rgba="0.55 0.42 0.30 1"/>
-      <geom type="box" pos="0.2 0.4 -0.35" size="0.02 0.02 0.35" rgba="0.3 0.3 0.3 1"/>
-      <geom type="box" pos="0.2 -0.4 -0.35" size="0.02 0.02 0.35" rgba="0.3 0.3 0.3 1"/>
-      <geom type="box" pos="-0.2 0.4 -0.35" size="0.02 0.02 0.35" rgba="0.3 0.3 0.3 1"/>
-      <geom type="box" pos="-0.2 -0.4 -0.35" size="0.02 0.02 0.35" rgba="0.3 0.3 0.3 1"/>
+    <body name="table" pos="0.42 0 0.76">
+      <geom type="box" size="0.22 0.40 0.02" rgba="0.55 0.42 0.30 1"/>
+      <geom type="box" pos="0.18 0.36 -0.38" size="0.02 0.02 0.38" rgba="0.3 0.3 0.3 1"/>
+      <geom type="box" pos="0.18 -0.36 -0.38" size="0.02 0.02 0.38" rgba="0.3 0.3 0.3 1"/>
+      <geom type="box" pos="-0.18 0.36 -0.38" size="0.02 0.02 0.38" rgba="0.3 0.3 0.3 1"/>
+      <geom type="box" pos="-0.18 -0.36 -0.38" size="0.02 0.02 0.38" rgba="0.3 0.3 0.3 1"/>
     </body>
-    <geom type="box" pos="0.42 0.15 0.745" size="0.025 0.025 0.025" rgba="0.9 0.1 0.1 1"/>
-    <geom type="cylinder" pos="0.48 -0.15 0.78" size="0.03 0.06" rgba="0.1 0.3 0.9 1"/>
-    <geom type="sphere" pos="0.60 0.0 0.76" size="0.04" rgba="0.1 0.8 0.2 1"/>
+    <geom type="box" pos="0.30 0.15 0.805" size="0.025 0.025 0.025" rgba="0.9 0.1 0.1 1"/>
+    <geom type="cylinder" pos="0.33 -0.15 0.84" size="0.03 0.06" rgba="0.1 0.3 0.9 1"/>
+    <geom type="sphere" pos="0.40 0.0 0.82" size="0.04" rgba="0.1 0.8 0.2 1"/>
 """
 
 
@@ -107,9 +109,10 @@ class G1FirstPersonView:
         self.d.qpos[self.qadr] = q
         self.mj.mj_kinematics(self.m, self.d)
 
-    def render_bgr(self):
+    def render_bgr(self, eye_offset=0.0):
+        """eye_offset: shift along the camera's left axis [m] (+ = left eye, - = right eye)."""
         R = self.d.xmat[self.torso].reshape(3, 3)
-        p = self.d.xpos[self.torso] + R @ self.CAM_POS
+        p = self.d.xpos[self.torso] + R @ (self.CAM_POS + np.array([0.0, eye_offset, 0.0]))
         c, s = np.cos(self.CAM_PITCH), np.sin(self.CAM_PITCH)
         fwd = R @ np.array([c, 0.0, -s])
         self.cam.distance = 1.0
@@ -125,8 +128,9 @@ class FpvThread(threading.Thread):
     """Renders the first-person view in its own thread so a slow GPU does not slow down the IK loop.
     The MuJoCo GL context is created inside this thread (GL contexts are bound to a thread)."""
 
-    def __init__(self, tv, assets_dir, h, w, fps, high_quality):
+    def __init__(self, tv, assets_dir, h, w, fps, high_quality, stereo=False, ipd=0.064):
         super().__init__(daemon=True)
+        self.stereo, self.ipd = stereo, ipd
         self.tv, self.assets_dir, self.h, self.w = tv, assets_dir, h, w
         self.period = 1.0 / fps
         self.high_quality = high_quality
@@ -160,7 +164,11 @@ class FpvThread(threading.Thread):
             with self.lock:
                 q = self.q.copy()
             fpv.set_arm_q(q)
-            self.tv.render_to_xr(fpv.render_bgr())
+            if self.stereo:  # side-by-side: left half = left eye (televuer binocular layout)
+                img = np.hstack([fpv.render_bgr(+self.ipd / 2), fpv.render_bgr(-self.ipd / 2)])
+            else:
+                img = fpv.render_bgr()
+            self.tv.render_to_xr(img)
             dt = time.perf_counter() - t0
             with self.lock:
                 self.times.append(dt * 1000)
@@ -208,6 +216,8 @@ def main():
     ap.add_argument("--fpv-size", default="640x480", help="WxH of the first-person view")
     ap.add_argument("--fpv-fps", type=float, default=30.0)
     ap.add_argument("--fpv-hq", action="store_true", help="shadows / reflections / anti-aliasing on")
+    ap.add_argument("--stereo", action="store_true", help="render left/right eye views (depth perception)")
+    ap.add_argument("--ipd", type=float, default=0.064, help="eye distance for --stereo [m]")
     args = ap.parse_args()
 
     winmm = windows_timer(not args.no_timer_fix)
@@ -220,20 +230,23 @@ def main():
 
     use_fpv = args.view == "fpv" and args.display != "pass-through"
     W, H = (int(v) for v in args.fpv_size.lower().split("x")) if use_fpv else (640, 480)
+    stereo = use_fpv and args.stereo
 
-    tv = TeleVuerWrapper(use_hand_tracking=(args.input == "hand"), binocular=False, img_shape=(H, W),
+    tv = TeleVuerWrapper(use_hand_tracking=(args.input == "hand"), binocular=stereo,
+                         img_shape=(H, 2 * W if stereo else W),
                          display_fps=args.frequency, display_mode=args.display,
                          zmq=(args.display != "pass-through"), webrtc=False,
                          cert_file=args.cert, key_file=args.key, arm_reference_mode="head_yaw")
 
     fpv = None
     if use_fpv:
-        fpv = FpvThread(tv, os.path.join(parent_dir, "assets", "g1"), H, W, args.fpv_fps, args.fpv_hq)
+        fpv = FpvThread(tv, os.path.join(parent_dir, "assets", "g1"), H, W, args.fpv_fps, args.fpv_hq,
+                        stereo=stereo, ipd=args.ipd)
         fpv.start()
         fpv.ready.wait()
         if fpv.error:
             raise fpv.error
-        print(f"[fpv] MuJoCo first-person renderer ready ({W}x{H}).")
+        print(f"[fpv] MuJoCo first-person renderer ready ({W}x{H}{' per eye, stereo' if stereo else ''}).")
 
     print("[ik] loading G1_29 model (first time may take a while)...")
     arm_ik = G1_29_ArmIK(Visualization=args.meshcat)
