@@ -17,3 +17,12 @@ TypeError: self._frozen cannot be converted to a Python object for pickling
 ## test_televuer_local.py
 
 Quest と Windows の間だけを確認するテストです。teleimager もロボットも要りません。テストパターンの画像を Quest に送り、手やコントローラのデータが届いているかを表示します。
+
+## 実機なしで確認するためのツール
+
+| ファイル | 置き場所 | 内容 |
+|---|---|---|
+| `ik_preview.py` | `xr_teleoperate/teleop/` | Quest → IK → MuJoCo による一人称視点(ロボット不要、Windows 単体で動く) |
+| `g1_mock_robot.py` | どこでも可(`--assets` で G1 のモデルを指定) | G1(29 関節)と Dex3 の模擬ロボット。MuJoCo で物理演算し、`rt/lowcmd` / `rt/arm_sdk` / `rt/dex3/*` を受け取り、`rt/lowstate` / `rt/dex3/*/state` を返す |
+| `arm_ctrl_check.py` | `xr_teleoperate/teleop/` | xr_teleoperate 本体の `G1_29_ArmController` で模擬ロボットを動かす(XR 機器は不要) |
+| `dds_check.py` | どこでも可 | 2 台の間の DDS の往復確認(ping / echo)。届いた割合、欠落、往復時間を表示する |
