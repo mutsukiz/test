@@ -15,13 +15,17 @@ Options:
     --view fpv|pattern   first-person robot view (default) or the old test pattern
     --meshcat            also show the meshcat visualizer (slower)
     --no-timer-fix       do NOT raise the Windows timer resolution (to compare)
+    --fpv-size 320x240   render the first-person view at a lower resolution
+    --fpv-fps 30         target frame rate of the first-person view (rendered in its own thread)
+    --fpv-hq             shadows / reflections / anti-aliasing on (slower)
 
-Reported every second: loop rate, IK / render time (mean / max), loop overruns.
-At startup: accuracy of time.sleep(4 ms) (robot_arm.py runs a ~250 Hz sleep loop).
+Reported every second: IK loop rate, IK time (mean / max), loop overruns, first-person render time / fps.
+At startup: accuracy of time.sleep(4 ms) (robot_arm.py runs a ~250 Hz sleep loop) and the OpenGL renderer.
 """
 import argparse
 import os
 import sys
+import threading
 import time
 
 import numpy as np
@@ -58,26 +62,46 @@ class G1FirstPersonView:
     CAM_POS = np.array([0.0576235, 0.01753, 0.42987])
     CAM_PITCH = 0.8307767239493009
 
-    def __init__(self, assets_dir, h, w, fovy=58.0):
+    def __init__(self, assets_dir, h, w, fovy=58.0, high_quality=False):
         import mujoco
         self.mj = mujoco
         xml_path = os.path.join(assets_dir, "g1_body29_hand14.xml")
         xml = open(xml_path, encoding="utf-8").read()
         meshdir = os.path.join(assets_dir, "meshes").replace("\\", "/")
         xml = xml.replace('meshdir="meshes"', f'meshdir="{meshdir}"')
+        # extra objects and the floor go to geom group 2, so that group 0 (= duplicated
+        # collision meshes of the robot) can be hidden without hiding them
+        xml = xml.replace('<geom name="floor"', '<geom name="floor" group="2"')
         i = xml.rfind("</worldbody>")
-        xml = xml[:i] + SCENE_EXTRA + xml[i:]
+        xml = xml[:i] + SCENE_EXTRA.replace("<geom ", '<geom group="2" ') + xml[i:]
         self.m = mujoco.MjModel.from_xml_string(xml)
         self.m.vis.global_.fovy = fovy
         self.m.vis.global_.offwidth = max(self.m.vis.global_.offwidth, w)
         self.m.vis.global_.offheight = max(self.m.vis.global_.offheight, h)
+        if not high_quality:
+            self.m.vis.quality.offsamples = 0
         self.d = mujoco.MjData(self.m)
         self.qadr = [self.m.jnt_qposadr[mujoco.mj_name2id(self.m, mujoco.mjtObj.mjOBJ_JOINT, n)] for n in ARM_JOINTS]
         self.torso = mujoco.mj_name2id(self.m, mujoco.mjtObj.mjOBJ_BODY, "torso_link")
         self.renderer = mujoco.Renderer(self.m, h, w)
+        self.opt = mujoco.MjvOption()
+        self.opt.geomgroup[0] = 0  # hide collision meshes (each robot mesh exists twice)
+        if not high_quality:
+            for f in (mujoco.mjtRndFlag.mjRND_SHADOW, mujoco.mjtRndFlag.mjRND_REFLECTION,
+                      mujoco.mjtRndFlag.mjRND_SKYBOX):
+                self.renderer.scene.flags[f] = False
         self.cam = mujoco.MjvCamera()
         self.cam.type = mujoco.mjtCamera.mjCAMERA_FREE
         self.set_arm_q(np.zeros(14))
+
+    def gl_info(self):
+        try:
+            self.renderer._gl_context.make_current()
+            from OpenGL import GL
+            return (f"{GL.glGetString(GL.GL_VENDOR).decode()} / {GL.glGetString(GL.GL_RENDERER).decode()}"
+                    f" / OpenGL {GL.glGetString(GL.GL_VERSION).decode()}")
+        except Exception as e:
+            return f"unknown ({e})"
 
     def set_arm_q(self, q):
         self.d.qpos[self.qadr] = q
@@ -92,9 +116,55 @@ class G1FirstPersonView:
         self.cam.lookat[:] = p + fwd * self.cam.distance
         self.cam.azimuth = np.degrees(np.arctan2(fwd[1], fwd[0]))
         self.cam.elevation = np.degrees(np.arcsin(np.clip(fwd[2], -1, 1)))
-        self.renderer.update_scene(self.d, camera=self.cam)
+        self.renderer.update_scene(self.d, camera=self.cam, scene_option=self.opt)
         rgb = self.renderer.render()
         return np.ascontiguousarray(rgb[:, :, ::-1])  # RGB -> BGR (render_to_xr expects BGR)
+
+
+class FpvThread(threading.Thread):
+    """Renders the first-person view in its own thread so a slow GPU does not slow down the IK loop.
+    The MuJoCo GL context is created inside this thread (GL contexts are bound to a thread)."""
+
+    def __init__(self, tv, assets_dir, h, w, fps, high_quality):
+        super().__init__(daemon=True)
+        self.tv, self.assets_dir, self.h, self.w = tv, assets_dir, h, w
+        self.period = 1.0 / fps
+        self.high_quality = high_quality
+        self.lock = threading.Lock()
+        self.q = np.zeros(14)
+        self.times = []
+        self.stop_event = threading.Event()
+        self.ready = threading.Event()
+        self.error = None
+
+    def set_arm_q(self, q):
+        with self.lock:
+            self.q = np.array(q, copy=True)
+
+    def pop_times(self):
+        with self.lock:
+            t, self.times = self.times, []
+        return t
+
+    def run(self):
+        try:
+            fpv = G1FirstPersonView(self.assets_dir, self.h, self.w, high_quality=self.high_quality)
+            print(f"[fpv] OpenGL: {fpv.gl_info()}")
+        except Exception as e:
+            self.error = e
+            self.ready.set()
+            return
+        self.ready.set()
+        while not self.stop_event.is_set():
+            t0 = time.perf_counter()
+            with self.lock:
+                q = self.q.copy()
+            fpv.set_arm_q(q)
+            self.tv.render_to_xr(fpv.render_bgr())
+            dt = time.perf_counter() - t0
+            with self.lock:
+                self.times.append(dt * 1000)
+            time.sleep(max(0.0, self.period - dt))
 
 
 def windows_timer(enable):
@@ -135,6 +205,9 @@ def main():
     ap.add_argument("--key", default=None)
     ap.add_argument("--meshcat", action="store_true", help="also show meshcat (slower)")
     ap.add_argument("--no-timer-fix", action="store_true", help="keep the default ~15.6 ms Windows timer")
+    ap.add_argument("--fpv-size", default="640x480", help="WxH of the first-person view")
+    ap.add_argument("--fpv-fps", type=float, default=30.0)
+    ap.add_argument("--fpv-hq", action="store_true", help="shadows / reflections / anti-aliasing on")
     args = ap.parse_args()
 
     winmm = windows_timer(not args.no_timer_fix)
@@ -145,16 +218,22 @@ def main():
     from televuer import TeleVuerWrapper
     from teleop.robot_control.robot_arm_ik import G1_29_ArmIK
 
-    H, W = 480, 640
-    fpv = None
-    if args.view == "fpv" and args.display != "pass-through":
-        fpv = G1FirstPersonView(os.path.join(parent_dir, "assets", "g1"), H, W)
-        print("[fpv] MuJoCo first-person renderer ready.")
+    use_fpv = args.view == "fpv" and args.display != "pass-through"
+    W, H = (int(v) for v in args.fpv_size.lower().split("x")) if use_fpv else (640, 480)
 
     tv = TeleVuerWrapper(use_hand_tracking=(args.input == "hand"), binocular=False, img_shape=(H, W),
                          display_fps=args.frequency, display_mode=args.display,
                          zmq=(args.display != "pass-through"), webrtc=False,
                          cert_file=args.cert, key_file=args.key, arm_reference_mode="head_yaw")
+
+    fpv = None
+    if use_fpv:
+        fpv = FpvThread(tv, os.path.join(parent_dir, "assets", "g1"), H, W, args.fpv_fps, args.fpv_hq)
+        fpv.start()
+        fpv.ready.wait()
+        if fpv.error:
+            raise fpv.error
+        print(f"[fpv] MuJoCo first-person renderer ready ({W}x{H}).")
 
     print("[ik] loading G1_29 model (first time may take a while)...")
     arm_ik = G1_29_ArmIK(Visualization=args.meshcat)
@@ -162,7 +241,7 @@ def main():
 
     period = 1.0 / args.frequency
     i = 0
-    ik_t, rd_t, loops, overruns = [], [], 0, 0
+    ik_t, loops, overruns = [], 0, 0
     t_report = time.perf_counter()
     try:
         while True:
@@ -175,23 +254,22 @@ def main():
                 if fpv is not None:
                     fpv.set_arm_q(sol_q)
 
-            if args.display != "pass-through":
-                t1 = time.perf_counter()
-                img = fpv.render_bgr() if fpv is not None else make_pattern(H, W, i)
-                tv.render_to_xr(img)
-                rd_t.append((time.perf_counter() - t1) * 1000)
+            if fpv is None and args.display != "pass-through":
+                tv.render_to_xr(make_pattern(H, W, i))
             i += 1
             loops += 1
 
             now = time.perf_counter()
             if now - t_report >= 1.0:
-                rd = f"render {np.mean(rd_t):5.1f} ms" if rd_t else "render  -"
-                if ik_t:
-                    print(f"loop {loops / (now - t_report):5.1f} Hz | IK mean {np.mean(ik_t):6.2f} ms"
-                          f"  max {np.max(ik_t):6.2f} ms | {rd} | overruns {overruns}")
-                else:
-                    print(f"loop {loops / (now - t_report):5.1f} Hz | {rd} | waiting for XR motion data...")
-                ik_t, rd_t, loops, overruns = [], [], 0, 0
+                el = now - t_report
+                rd = ""
+                if fpv is not None:
+                    rt = fpv.pop_times()
+                    rd = (f" | fpv {len(rt) / el:4.1f} fps, render {np.mean(rt):5.1f} ms" if rt else " | fpv -")
+                ik = (f"IK mean {np.mean(ik_t):6.2f} ms  max {np.max(ik_t):6.2f} ms" if ik_t
+                      else "waiting for XR motion data...")
+                print(f"loop {loops / el:5.1f} Hz | {ik} | overruns {overruns}{rd}")
+                ik_t, loops, overruns = [], 0, 0
                 t_report = now
 
             dt = time.perf_counter() - t0
@@ -201,6 +279,9 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        if fpv is not None:
+            fpv.stop_event.set()
+            fpv.join(timeout=1.0)
         tv.close()
         if winmm:
             winmm.timeEndPeriod(1)
