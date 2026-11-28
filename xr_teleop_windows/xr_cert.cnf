@@ -1,0 +1,17 @@
+# OpenSSL config for the televuer self-signed certificate (Quest / Pico).
+# Replace BOTH IP addresses with the IP the headset uses to reach the Windows host (its Wi-Fi IP).
+#   openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout key.pem -out cert.pem -config xr_cert.cnf
+# (A custom config avoids "v2i_AUTHORITY_KEYID:unknown option ... nonss" with some Windows OpenSSL builds.)
+[req]
+distinguished_name = dn
+x509_extensions = v3_srv
+prompt = no
+
+[dn]
+CN = 192.168.123.2
+
+[v3_srv]
+basicConstraints = critical,CA:FALSE
+keyUsage = critical,digitalSignature,keyEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = IP:192.168.123.2

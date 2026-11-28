@@ -1,0 +1,31 @@
+# xr_teleoperate on a Windows host - pinned Python packages (conda env with python=3.10, pinocchio=3.1.0 from conda-forge)
+# Install:  pip install -r requirements-windows.txt
+# NOTE: dex-retargeting itself is installed separately with --no-deps (see WINDOWS_HOST_GUIDE.md),
+#       otherwise pip pulls the PyPI "pin" package and breaks conda's pinocchio (casadi bindings).
+numpy==1.26.4
+
+# televuer (XR side)
+vuer[all]==0.0.60
+params-proto==2.13.2        # 3.x removed "Flag" -> "ImportError: cannot import name 'Vuer'"
+
+# xr_teleoperate requirements.txt
+matplotlib==3.7.5
+rerun-sdk==0.20.1           # NOT "rerun" (different package)
+meshcat==0.3.2
+sshkeyboard==2.3.1
+
+# IK: casadi comes with conda-forge pinocchio=3.1.0 (pinocchio.casadi is built against it).
+#     Do NOT pip install casadi / pin on top of it.
+
+# dex-retargeting dependencies (Dex3 / Inspire / BrainCo hand retargeting)
+torch==2.3.0
+pytransform3d>=3.5.0
+nlopt>=2.6.1,<2.8.0
+trimesh>=4.4.0
+anytree>=2.12.0
+pyyaml>=6.0.0
+lxml>=5.2.2
+six
+
+# optional: verification tools (ik_preview.py first-person view, g1_mock_robot.py)
+mujoco

@@ -1,5 +1,7 @@
 # xr_teleoperate を Windows で使うための修正とテスト
 
+**手順書は [`WINDOWS_HOST_GUIDE.md`](WINDOWS_HOST_GUIDE.md) を参照してください。** パッチは `apply_windows_patches.py` 1 本にまとめてあり(televuer の修正も含む)、依存パッケージは `requirements-windows.txt`、証明書の設定ファイルは `xr_cert.cnf` です。
+
 ## televuer の Windows 対応(spawn 対応)
 
 Windows の multiprocessing は `spawn` 方式です。そのため元の televuer は、`Process(target=self._vuer_run)` で TeleVuer オブジェクトを pickle しようとして、次のエラーで失敗します。

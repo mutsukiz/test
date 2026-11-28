@@ -15,7 +15,15 @@ What it changes
    - Windows: the hand control process cannot receive the parent's DDS publishers / threads
      (multiprocessing "spawn" pickles them -> crash). The child now creates its own DDS
      participant, publishers and HandRetargeting, then runs the unchanged control_process().
-On Linux nothing changes in behaviour (all changes are guarded by os.name == "nt").
+3. teleop/televuer/src/televuer/televuer.py (televuer submodule, commit 766de45)
+   - The vuer server object is built inside the child process (a Vuer object cannot be pickled
+     with "spawn"); the image shared memory is re-attached in the child.
+   - SharedMemory size is passed as a Python int (Windows CreateFileMapping rejects numpy.int64).
+   (A televuer.py that was replaced by the pre-patched copy ("[win-spawn]") is left as it is.)
+4. Creates the folder for CycloneDDS' trace file "/tmp/cdds.LOG" (unitree_sdk2_python writes it
+   when --network-interface is given; without the folder DDS initialisation fails on Windows).
+On Linux nothing changes in behaviour (2 and the Windows-only parts of 1 are guarded by
+os.name == "nt"; 3 also works with "fork").
 
 Not covered: Inspire / BrainCo hands (same pattern, not patched), --ipc (uses Linux-only
 "ipc://@..." sockets: do not use --ipc on Windows; keyboard control via sshkeyboard works).
@@ -28,18 +36,83 @@ import sys
 MARK = "[win-patch]"
 
 
-def patch_file(path, fn):
-    src = open(path, encoding="utf-8").read()
-    if MARK in src:
+def patch_file(path, fn, markers=(MARK,)):
+    raw = open(path, encoding="utf-8", newline="").read()
+    if any(mk in raw for mk in markers):
         print(f"  already patched: {path}")
         return
+    crlf = "\r\n" in raw
+    src = raw.replace("\r\n", "\n")
     new = fn(src)
     if new == src:
-        raise SystemExit(f"  pattern not found, not patched: {path}")
+        raise SystemExit(f"  pattern not found, not patched: {path}\n"
+                         f"  (is the file from the expected commit? restore it with git checkout and retry)")
     if not os.path.exists(path + ".orig"):
         shutil.copy2(path, path + ".orig")
+    if crlf:
+        new = new.replace("\n", "\r\n")
     open(path, "w", encoding="utf-8", newline="").write(new)
     print(f"  patched: {path}")
+
+
+TELEVUER_REPLACEMENTS = [
+    ("""        self.vuer = Vuer(host='0.0.0.0', cert=cert_file, key=key_file, queries=dict(grid=False), queue_len=3)
+        self.vuer.add_handler("CAMERA_MOVE")(self.on_cam_move)
+        if self.use_hand_tracking:
+            self.vuer.add_handler("HAND_MOVE")(self.on_hand_move)
+        else:
+            self.vuer.add_handler("CONTROLLER_MOVE")(self.on_controller_move)
+""",
+     """        # [win-patch] Vuer is built inside the child process (see _build_vuer), because
+        # on Windows multiprocessing uses "spawn" and a Vuer object cannot be pickled.
+        self._cert_file = cert_file
+        self._key_file = key_file
+"""),
+    ("        self.vuer.spawn(start=False)(fn)\n",
+     "        self._vuer_fn_name = fn.__name__\n"),
+    ("""    def _vuer_run(self):
+        try:
+            self.vuer.run()""",
+     """    # [win-patch] attributes that only live in the parent process
+    _PARENT_ONLY = ("vuer", "process", "writer_thread", "new_frame_event",
+                    "stop_writer_event", "latest_frame", "img2display")
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        for k in self._PARENT_ONLY:
+            state.pop(k, None)
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        # re-attach the image buffer to the same shared memory block in the child
+        if "img2display_shm" in state:
+            self.img2display = np.ndarray(self.img_shape, dtype=np.uint8, buffer=self.img2display_shm.buf)
+
+    def _build_vuer(self):
+        self.vuer = Vuer(host='0.0.0.0', cert=self._cert_file, key=self._key_file, queries=dict(grid=False), queue_len=3)
+        self.vuer.add_handler("CAMERA_MOVE")(self.on_cam_move)
+        if self.use_hand_tracking:
+            self.vuer.add_handler("HAND_MOVE")(self.on_hand_move)
+        else:
+            self.vuer.add_handler("CONTROLLER_MOVE")(self.on_controller_move)
+        self.vuer.spawn(start=False)(getattr(self, self._vuer_fn_name))
+
+    def _vuer_run(self):
+        try:
+            self._build_vuer()
+            self.vuer.run()"""),
+    ("shared_memory.SharedMemory(create=True, size=np.prod(self.img_shape) * np.uint8().itemsize)",
+     "shared_memory.SharedMemory(create=True, size=int(np.prod(self.img_shape)) * np.dtype(np.uint8).itemsize)"),
+]
+
+
+def patch_televuer(src):
+    for old, new in TELEVUER_REPLACEMENTS:
+        if old not in src:
+            return src  # unexpected version -> patch_file reports "pattern not found"
+        src = src.replace(old, new)
+    return src
 
 
 def patch_main(src):
@@ -109,6 +182,12 @@ def main():
     print(f"xr_teleoperate: {root}")
     patch_file(os.path.join(root, "teleop", "teleop_hand_and_arm.py"), patch_main)
     patch_file(os.path.join(root, "teleop", "robot_control", "robot_hand_unitree.py"), patch_dex3)
+    patch_file(os.path.join(root, "teleop", "televuer", "src", "televuer", "televuer.py"), patch_televuer,
+               markers=(MARK, "[win-spawn]"))
+    if os.name == "nt":
+        tmp = os.path.abspath("/tmp")  # where CycloneDDS resolves "/tmp/cdds.LOG" (root of the current drive)
+        os.makedirs(tmp, exist_ok=True)
+        print(f"  folder for CycloneDDS trace file: {tmp}")
     print("done.")
 
 
