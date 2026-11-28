@@ -136,6 +136,8 @@ def main():
     ap.add_argument("--state-hz", type=float, default=250.0,
                     help="rt/lowstate publish rate (real robot: 500 Hz; 250 Hz = xr_teleoperate's control rate)")
     ap.add_argument("--viewer", action="store_true", help="open the MuJoCo viewer")
+    ap.add_argument("--viewer-fps", type=float, default=20.0,
+                    help="viewer refresh rate; lower it if 'realtime' drops below 1.0 (slow GPU)")
     ap.add_argument("--no-objects", action="store_true")
     args = ap.parse_args()
 
@@ -235,7 +237,7 @@ def main():
     t_next = t_start
     t_report, sim_report = t_start, d.time
     last_view = 0.0
-    max_err, phys_ms = 0.0, []
+    max_err, phys_ms, view_ms = 0.0, [], []
     prev_counts = {k: 0 for k in ("low", "sdk", "lh", "rh")}
     mode_used = "hold"
     try:
@@ -287,11 +289,7 @@ def main():
             m.actuator_biasprm[:, 2] = -all_kd
             d.ctrl[:] = all_q
 
-            if viewer is not None:
-                with viewer.lock():
-                    mujoco.mj_step(m, d)
-            else:
-                mujoco.mj_step(m, d)
+            mujoco.mj_step(m, d)  # the passive viewer renders from its own copy made in sync()
             step += 1
             if mode_used != "hold":
                 max_err = max(max_err, float(np.max(np.abs(q_cmd[ARM_IDS] - d.qpos[body_q][ARM_IDS]))))
@@ -307,8 +305,10 @@ def main():
                     pub.Write(msg)
             phys_ms.append((time.perf_counter() - t0) * 1000)
 
-            if viewer is not None and now - last_view > 1 / 60:
+            if viewer is not None and now - last_view > 1.0 / args.viewer_fps:
+                tv0 = time.perf_counter()
                 viewer.sync()
+                view_ms.append((time.perf_counter() - tv0) * 1000)
                 last_view = now
 
             # ---------- report ----------
@@ -321,6 +321,8 @@ def main():
                 line = (f"[mock] {mode_used:7s} | lowcmd {hz['low']:5.0f} Hz  arm_sdk {hz['sdk']:5.0f} Hz"
                         f"  dex3 L/R {hz['lh']:4.0f}/{hz['rh']:4.0f} Hz | step {np.mean(phys_ms):4.2f} ms"
                         f"  realtime x{rtf:4.2f}")
+                if view_ms:
+                    line += f" | viewer {len(view_ms) / el:4.1f} fps, sync {np.mean(view_ms):5.1f} ms"
                 if mode_used == "lowcmd":
                     line += f" | kp arm/wrist/leg {lowcmd.kp[15]:.0f}/{lowcmd.kp[19]:.0f}/{lowcmd.kp[0]:.0f}"
                 elif mode_used == "arm_sdk":
@@ -330,7 +332,7 @@ def main():
                 errs = (f"crc_err {lowcmd.crc_err + armsdk.crc_err}  mode_machine_mismatch "
                         f"{lowcmd.mm_mismatch + armsdk.mm_mismatch}  nan {lowcmd.nan + armsdk.nan + lhcmd.nan + rhcmd.nan}")
                 print(line + " | " + errs)
-                t_report, sim_report, max_err, phys_ms = now, d.time, 0.0, []
+                t_report, sim_report, max_err, phys_ms, view_ms = now, d.time, 0.0, [], []
 
             # ---------- real-time pacing ----------
             t_next += dt
@@ -345,6 +347,8 @@ def main():
         if viewer is not None:
             viewer.close()
         print("[mock] stopped.")
+        # skip interpreter teardown: DDS listener threads may still call into Python -> segfault on exit
+        os._exit(0)
 
 
 if __name__ == "__main__":
